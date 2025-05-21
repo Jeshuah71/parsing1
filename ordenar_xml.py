@@ -1,179 +1,230 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script to sort <object> elements in an XML file, strip sensitive data,
-promote <property name="title"> into <title>, and emit:
+ordenar_xml.py
 
-  • cleaned, namespace-stripped, sorted XML → output.xml
-  • user-friendly HTML report             → output.html
-
-In the HTML, any <link> elements or properties named “link” or “url” will be
-rendered as clickable <a> tags, so you don’t lose those important URLs.
+1) Sort <object class="Page"> by id/title/datetime
+2) Strip passwords & IPs
+3) Promote <property name="title"> → <title>
+4) Emit:
+   • sorted XML → output_file
+   • rich HTML report → output_file.html
 """
 
-import argparse
-import sys
-import re
+import argparse, sys, re, html
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as md
 from datetime import datetime
 from pathlib import Path
-import html
 
-IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-URL_PATTERN = re.compile(r"https?://\S+")
+IP_RE  = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+URL_RE = re.compile(r"https?://[^\s<>\]]+")
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Sort <object> in XML, remove sensitive fields, promote title, then export to HTML"
+        description="Sort Confluence Page objects, strip sensitive data, promote title, emit HTML"
     )
-    p.add_argument("input_file",  help="Path to the input XML file")
-    p.add_argument("output_file", help="Path where the sorted XML will be saved")
+    p.add_argument("input_file",  help="Original XML dump")
+    p.add_argument("output_file", help="Basename for sorted XML & HTML")
     p.add_argument(
         "-k","--key",
         choices=["id","title","datetime"],
         default="id",
-        help="Sort by: 'id' (numeric), 'title' (alphabetical), 'datetime' (timestamp)"
+        help="Sort by 'id', 'title', or 'datetime'"
     )
     return p.parse_args()
 
-def strip_namespaces(elem):
-    """Drop any namespace prefixes in tags."""
-    for e in elem.iter():
-        if isinstance(e.tag, str) and "}" in e.tag:
-            e.tag = e.tag.split("}",1)[1]
-    return elem
+def strip_ns(root):
+    for el in root.iter():
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}",1)[1]
+    return root
+
+def remove_sensitive(obj):
+    # Drop any property or attribute with "password" or an IP
+    for p in list(obj.findall(".//property")):
+        n = (p.get("name") or "").lower()
+        t = p.text or ""
+        if "password" in n or IP_RE.search(t):
+            parent = next((pr for pr in obj.iter() for ch in pr if ch is p), None)
+            if parent:
+                parent.remove(p)
+    for a,v in list(obj.attrib.items()):
+        if "password" in a.lower() or IP_RE.search(v):
+            del obj.attrib[a]
 
 def promote_title(obj):
-    """Turn the first descendant <property name="title"> into a direct <title> child."""
+    # Promote <property name="title"> → <title>
     prop = obj.find(".//property[@name='title']")
     if not prop:
-        return
-    title_el = ET.Element("title")
-    if prop.text:
-        title_el.text = prop.text
-    for child in list(prop):
-        title_el.append(child)
-    obj.insert(0, title_el)
-    # remove original title property
-    parent_map = {c: p for p in obj.iter() for c in p}
-    parent = parent_map.get(prop, obj)
-    parent.remove(prop)
+        return False
+    t = ET.Element("title")
+    t.text = (prop.text or "").strip()
+    obj.insert(0, t)
+    # remove the old <property>
+    parent = next((pr for pr in obj.iter() for ch in pr if ch is prop), None)
+    if parent:
+        parent.remove(prop)
+    return True
 
-def remove_sensitive_data(obj):
-    for prop in list(obj.findall(".//property")):
-        n = prop.get("name","").lower()
-        t = (prop.text or "").strip()
-        if "password" in n or IP_PATTERN.search(t):
-            parent_map = {c: p for p in obj.iter() for c in p}
-            parent = parent_map.get(prop, obj)
-            parent.remove(prop)
-    for attr,val in list(obj.attrib.items()):
-        if "password" in attr.lower() or IP_PATTERN.search(val):
-            del obj.attrib[attr]
-
-def get_key_func(key):
-    if key=="id":
+def get_sort_key(mode):
+    if mode=="id":
         return lambda o: int(o.findtext("id[@name='id']","0") or 0)
-    if key=="title":
-        return lambda o: o.findtext("title","").lower()
-    if key=="datetime":
-        def k(o):
+    if mode=="title":
+        return lambda o: (o.findtext("title","") or "").lower()
+    if mode=="datetime":
+        def fk(o):
             ds = o.get("datetime","")
-            try: return datetime.strptime(ds,"%Y-%m-%d %H:%M:%S")
-            except: return datetime.min
-        return k
+            try:
+                return datetime.strptime(ds, "%Y-%m-%d %H:%M:%S")
+            except:
+                return datetime.min
+        return fk
     return lambda o: 0
 
+def linkify(txt):
+    parts   = URL_RE.split(txt)
+    matches = URL_RE.findall(txt)
+    out = []
+    for i,part in enumerate(parts):
+        out.append(html.escape(part))
+        if i < len(matches):
+            u = html.escape(matches[i])
+            out.append(f'<a href="{u}" target="_blank">{u}</a>')
+    return "".join(out)
+
+def serialize_children(elem):
+    """Render all child nodes of <element> as HTML, or fallback to text."""
+    frags = [ET.tostring(c, encoding="unicode", method="html") for c in elem]
+    joined = "".join(frags).strip()
+    if not joined:
+        joined = html.escape((elem.text or "").strip())
+    return joined
+
 def main():
-    args    = parse_args()
-    inp     = Path(args.input_file)
-    xml_out = Path(args.output_file)
+    args = parse_args()
+    inp  = Path(args.input_file)
+    outp = Path(args.output_file)
 
     # 1) parse & strip namespaces
     try:
         tree = ET.parse(inp)
-        root = strip_namespaces(tree.getroot())
     except Exception as e:
-        print(f"[ERROR] parsing '{inp}': {e}", file=sys.stderr)
+        print(f"[ERROR] parsing {inp}: {e}", file=sys.stderr)
         sys.exit(1)
+    root = strip_ns(tree.getroot())
 
-    # 2) clean + promote title
-    objects = root.findall("object")
-    for o in objects:
-        remove_sensitive_data(o)
+    # 2) collect all Page objects
+    pages = [o for o in root.findall("object") if o.get("class")=="Page"]
+
+    # 3) clean & promote title on every page
+    for o in pages:
+        remove_sensitive(o)
         promote_title(o)
 
-    # 3) sort
-    key_func    = get_key_func(args.key)
-    sorted_objs = sorted(objects, key=key_func)
+    # 4) sort the pages
+    pages.sort(key=get_sort_key(args.key))
 
-    # 4) rebuild
-    for o in objects:     root.remove(o)
-    for o in sorted_objs: root.append(o)
+    # 5) rebuild under root
+    for old in root.findall("object"):
+        if old in pages:
+            root.remove(old)
+    for p in pages:
+        root.append(p)
 
-    # 5) write XML with pretty-print so you can see <title>
-    rough = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    pretty_xml = md.parseString(rough).toprettyxml(indent="  ")
-    try:
-        xml_out.write_text(pretty_xml, encoding="utf-8")
-        print(f"[OK] Sorted XML with <title> tags saved to {xml_out}")
-    except Exception as e:
-        print(f"[ERROR] writing XML: {e}", file=sys.stderr)
-        sys.exit(1)
+    # 6) write sorted XML
+    xml_bytes  = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    pretty_xml = md.parseString(xml_bytes).toprettyxml(indent="  ")
+    outp.write_text(pretty_xml, encoding="utf-8")
+    print(f"[OK] XML → {outp}")
 
-    # 6) build HTML report, rendering any link/url as <a href=...>
-    html_out = xml_out.with_suffix(".html")
+    # 7) build HTML report
+    html_out = outp.with_suffix(".html")
+    print(f"[DEBUG] writing HTML report to {html_out}")
+
     lines = [
-      "<!DOCTYPE html>",
-      "<html><head><meta charset='utf-8'><title>Objects Report</title>",
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Pages Report</title>",
       "<style>",
-      " body{font-family:sans-serif;padding:1em;}",
-      " section{border:1px solid #ccc; padding:1em; margin:1em 0;}",
-      " h2{margin:0 0.5em 0.3em;} a{color:blue;}",
+      " body{font:14px sans-serif;margin:1em;} ",
+      " section{border:1px solid #ccc;padding:1em;margin:1em 0;} ",
+      " strong.label{display:block;margin-top:1em;font-size:1.1em;} ",
       "</style></head><body>",
-      f"<h1>Objects ({len(sorted_objs)})</h1>"
+      f"<h1>Pages ({len(pages)})</h1>"
     ]
 
-    for o in sorted_objs:
-        title = html.escape(o.findtext("title","(no title)"))
-        oid   = html.escape(o.findtext("id[@name='id']","(no id)"))
-        dt    = html.escape(o.get("datetime","(no datetime)"))
-        lines += [
-            "<section>",
-            f"<h2>{title}</h2>",
-            f"<p><strong>ID:</strong> {oid}</p>",
-            f"<p><strong>Datetime:</strong> {dt}</p>"
-        ]
+    for o in pages:
+        # Title (from promoted <title> or fallback to lowerTitle or no title)
+        title = o.findtext("title","").strip()
+        if not title:
+            title = o.findtext(".//property[@name='lowerTitle']","").strip()
+        if not title:
+            title = "(no title)"
 
-        # first, any <link> child elements
-        for link in o.findall(".//link"):
-            url = (link.text or "").strip()
-            if URL_PATTERN.match(url):
-                lines.append(f'<p><strong>Link:</strong> <a href="{html.escape(url)}" target="_blank">{html.escape(url)}</a></p>')
+        lines.append("<section>")
+        lines.append(f"<h2>{html.escape(title)}</h2>")
 
-        # then properties
+        # ID & Datetime
+        if (i:=o.findtext("id[@name='id']")):
+            lines.append(f"<p><strong>ID:</strong> {html.escape(i)}</p>")
+        if (dt:=o.get("datetime")):
+            lines.append(f"<p><strong>Datetime:</strong> {html.escape(dt)}</p>")
+
+        # Lower Title
+        if (lt:=o.findtext(".//property[@name='lowerTitle']")):
+            lines.append(f"<p><strong>Lower Title:</strong> {html.escape(lt)}</p>")
+
+        # Body Contents
+        if (bc:=o.find(".//collection[@name='bodyContents']")) is not None:
+            lines.append('<strong class="label">Body Contents</strong><ul>')
+            for el in bc.findall("element"):
+                lines.append(f"<li>{serialize_children(el)}</li>")
+            lines.append("</ul>")
+
+        # bodyContent property
+        if (bcp:=o.findtext(".//property[@name='bodyContent']")):
+            lines.append(f"<p><strong>BodyContent:</strong> {html.escape(bcp)}</p>")
+
+        # Full <property name="body">
+        if (bp := o.find(".//property[@name='body']")) is not None:
+            # capture text before any children
+            body_html = bp.text or ""
+            # capture each child (tags, CDATA macros, tails)
+            for child in bp:
+                body_html += ET.tostring(child, encoding="unicode", method="html")
+                if child.tail:
+                    body_html += child.tail
+            lines.append('<strong class="label">Body</strong>')
+            lines.append('<div style="white-space: pre-wrap; margin-left:1em;">')
+            lines.append(body_html)
+            lines.append("</div>")
+
+        # Outgoing Links
+        if (ol:=o.find(".//collection[@name='outgoingLinks']")) is not None:
+            lines.append('<strong class="label">Outgoing Links</strong><ul>')
+            for el in ol.findall("element"):
+                lines.append(f"<li>{serialize_children(el)}</li>")
+            lines.append("</ul>")
+
+        # content property
+        if (ct:=o.findtext(".//property[@name='content']")):
+            lines.append(f"<p><strong>Content:</strong> {html.escape(ct)}</p>")
+
+        # all other properties
+        skip = {"title","lowertitle","body","bodycontent","content"}
         for p in o.findall(".//property"):
-            name = p.get("name","(no name)")
-            text = (p.text or "").strip()
-            low = name.lower()
-            # if it's a URL-valued property
-            if low in ("link","url") and URL_PATTERN.match(text):
-                lines.append(f'<p><strong>{html.escape(name)}:</strong> <a href="{html.escape(text)}" target="_blank">{html.escape(text)}</a></p>')
-            else:
-                lines.append(f"<p><strong>{html.escape(name)}:</strong> {html.escape(text)}</p>")
+            nm = (p.get("name") or "").lower()
+            if nm in skip:
+                continue
+            txt = (p.text or "").strip()
+            lines.append(
+              f"<p><strong>{html.escape(p.get('name',''))}:</strong> {linkify(txt)}</p>"
+            )
 
         lines.append("</section>")
 
     lines.append("</body></html>")
-
-    try:
-        html_out.write_text("\n".join(lines), encoding="utf-8")
-        print(f"[OK] HTML report saved to {html_out}")
-    except Exception as e:
-        print(f"[ERROR] writing HTML: {e}", file=sys.stderr)
-        sys.exit(1)
-
+    html_out.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[OK] HTML → {html_out}")
 
 if __name__=="__main__":
     main()
